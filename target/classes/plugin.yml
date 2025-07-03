@@ -1,0 +1,15 @@
+main: com.swevmc.BeachIslands
+name: BeachIslands
+version: 1.0
+api-version: 1.21
+commands:
+  island:
+    description: Island main command
+    aliases: [is]
+    usage: /island <create|upgrades|delete>
+  shorestart:
+    description: Start/stop the Shore Supply event
+    usage: /shorestart [start|stop]
+    permission: beachislands.supplyevent
+depend: [FastAsyncWorldEdit, WorldGuard]
+softdepend: [Vault]
