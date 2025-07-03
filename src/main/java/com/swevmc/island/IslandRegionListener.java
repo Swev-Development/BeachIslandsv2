@@ -36,12 +36,10 @@ public class IslandRegionListener implements Listener {
         boolean outZ = pz < (z - half) || pz > (z + half);
 
         if (outX || outZ) {
-            // Calculate push direction back to center
             Location center = new Location(player.getWorld(), x + 0.5, to.getY(), z + 0.5);
-            Vector pushDir = center.toVector().subtract(to.toVector()).normalize().multiply(1.5); // 1.5 block push
+            Vector pushDir = center.toVector().subtract(to.toVector()).normalize().multiply(1.5);
             player.setVelocity(pushDir);
 
-            // Optional: Small teleport to prevent stuck
             Location inside = to.clone();
             if (outX) inside.setX(Math.max(x - half + 0.5, Math.min(x + half - 0.5, px)));
             if (outZ) inside.setZ(Math.max(z - half + 0.5, Math.min(z + half - 0.5, pz)));

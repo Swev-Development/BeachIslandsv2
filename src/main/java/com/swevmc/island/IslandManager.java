@@ -286,7 +286,6 @@ public class IslandManager {
         });
     }
 
-    // --- VIRTUAL YELLOW GLASS BORDER ---
     private void startBorderDisplayTask() {
         new BukkitRunnable() {
             @Override
@@ -353,7 +352,6 @@ public class IslandManager {
             player.sendBlockChange(loc, loc.getBlock().getBlockData());
         }
     }
-    // --- END VIRTUAL GLASS BORDER ---
 
     public void upgradeIslandBorder(Player player) {
         IslandData data = getIsland(player.getUniqueId());
