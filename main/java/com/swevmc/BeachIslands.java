@@ -65,7 +65,10 @@ public class BeachIslands extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        if (islandManager != null) islandManager.saveAll();
+        if (islandManager != null) {
+            islandManager.saveAll();
+            islandManager.shutdown();
+        }
         if (shoreSupplyEvent != null && shoreSupplyEvent.isRunning()) {
             shoreSupplyEvent.stopEvent();
         }

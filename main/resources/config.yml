@@ -18,3 +18,4 @@ shore-supply-loot:
   - ENDER_PEARL:5
   - IRON_INGOT:12
   - TNT:2
+generation-threads: 2

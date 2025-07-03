@@ -10,7 +10,8 @@ import org.bukkit.entity.Player;
 import org.bukkit.Location;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.scheduler.BukkitRunnable;
-
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.io.File;
 import java.io.IOException;
 import java.util.*;
@@ -39,11 +40,17 @@ public class IslandManager {
     private YamlConfiguration dataConfig;
     private final Map<UUID, BukkitRunnable> titleTasks = new HashMap<>();
     private final Map<UUID, Set<Location>> borderBlocksShown = new HashMap<>();
+    private final Map<String, Clipboard> schematicCache = new ConcurrentHashMap<>();
+    private final ExecutorService generationExecutor;
+    private final Set<String> occupiedCoordinates = ConcurrentHashMap.newKeySet();
+    private final AtomicInteger spiralIndex = new AtomicInteger(0);
     private static final String THEME = "§x§F§D§F§9§C§3";
 
     public IslandManager(BeachIslands plugin) {
         this.plugin = plugin;
         this.dataFile = new File(plugin.getDataFolder(), "data.yml");
+        int threads = plugin.getConfig().getInt("generation-threads", 2);
+        this.generationExecutor = Executors.newFixedThreadPool(Math.max(1, threads));
         loadIslandTypes();
         loadData();
         startBorderDisplayTask();
@@ -67,25 +74,50 @@ public class IslandManager {
         player.sendMessage(getPrefix() + msg);
     }
 
-    private int[] getNextRandomCoords(org.bukkit.World bukkitWorld, int width, int length, int minDist, int maxTries, int range) {
-        Random rng = new Random();
-        List<IslandData> islands = new ArrayList<>(playerIslands.values());
-        for (int attempt = 0; attempt < maxTries; attempt++) {
-            int x = (rng.nextInt(range * 2 + 1) - range) / minDist * minDist;
-            int z = (rng.nextInt(range * 2 + 1) - range) / minDist * minDist;
-            if (x == 0 && z == 0) continue;
-            boolean tooClose = false;
-            for (IslandData d : islands) {
-                double dist = Math.hypot(x - d.getOriginX(), z - d.getOriginZ());
-                if (dist < minDist) {
-                    tooClose = true;
-                    break;
-                }
+    private int[] getNextAvailableCoords(int minDist) {
+        int index = spiralIndex.getAndIncrement();
+        while (true) {
+            int[] coords = getSpiralCoords(index, minDist);
+            String key = coords[0] + "," + coords[1];
+            if (occupiedCoordinates.add(key)) {
+                return coords;
             }
-            if (tooClose) continue;
-            return new int[]{x, z};
+            index = spiralIndex.getAndIncrement();
         }
-        return new int[]{0, range};
+    }
+
+    private int[] getSpiralCoords(int n, int spacing) {
+        if (n == 0) return new int[]{0, 0};
+
+        int ring = (int) Math.ceil((Math.sqrt(n) - 1) / 2);
+        int ringSideLength = 2 * ring;
+        int ringStartIndex = (2 * ring - 1) * (2 * ring - 1);
+        int posInRing = n - ringStartIndex;
+
+        int side = posInRing / ringSideLength;
+        int posOnSide = posInRing % ringSideLength;
+
+        int x, z;
+        switch (side) {
+            case 0:
+                x = ring;
+                z = -ring + posOnSide;
+                break;
+            case 1:
+                x = ring - posOnSide;
+                z = ring;
+                break;
+            case 2:
+                x = -ring;
+                z = ring - posOnSide;
+                break;
+            default:
+                x = -ring + posOnSide;
+                z = -ring;
+                break;
+        }
+
+        return new int[]{x * spacing, z * spacing};
     }
 
     private void showPersistentTitle(Player player, String main, String sub) {
@@ -110,14 +142,66 @@ public class IslandManager {
         player.resetTitle();
     }
 
+    private Clipboard loadSchematic(File file) throws Exception {
+        String key = file.getName();
+        Clipboard cached = schematicCache.get(key);
+        if (cached != null) return cached;
+        Clipboard clipboard = ClipboardFormats.findByFile(file)
+                .getReader(new java.io.FileInputStream(file))
+                .read();
+        schematicCache.put(key, clipboard);
+        return clipboard;
+    }
+
+    private CompletableFuture<Void> preloadChunks(org.bukkit.World world, int centerX, int centerZ, int radiusBlocks) {
+        List<CompletableFuture<org.bukkit.Chunk>> futures = new ArrayList<>();
+
+        int chunkRadius = (radiusBlocks / 16) + 1;
+        int centerChunkX = centerX >> 4;
+        int centerChunkZ = centerZ >> 4;
+
+        for (int ring = 0; ring <= chunkRadius; ring++) {
+            for (int dx = -ring; dx <= ring; dx++) {
+                for (int dz = -ring; dz <= ring; dz++) {
+                    if (Math.abs(dx) != ring && Math.abs(dz) != ring) continue;
+
+                    int chunkX = centerChunkX + dx;
+                    int chunkZ = centerChunkZ + dz;
+
+                    futures.add(world.getChunkAtAsync(chunkX, chunkZ));
+                }
+            }
+        }
+
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+    }
+
+    private BlockVector3 findGoldBlockInClipboard(Clipboard clipboard) {
+        Region region = clipboard.getRegion();
+        BlockVector3 min = region.getMinimumPoint();
+        BlockVector3 max = region.getMaximumPoint();
+
+        for (int x = min.getX(); x <= max.getX(); x++) {
+            for (int y = min.getY(); y <= max.getY(); y++) {
+                for (int z = min.getZ(); z <= max.getZ(); z++) {
+                    BlockVector3 pos = BlockVector3.at(x, y, z);
+                    if (clipboard.getBlock(pos).getBlockType() == BlockTypes.GOLD_BLOCK) {
+                        return pos.subtract(clipboard.getOrigin());
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     public void createIsland(Player player, IslandType type) {
         org.bukkit.World bukkitWorld = Bukkit.getWorld("world");
         if (bukkitWorld == null) {
             send(player, "§cWorld not found (world). Contact admin.");
             return;
         }
-        showPersistentTitle(player, THEME + "Creating Island...", "Please wait!");
-        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+        showPersistentTitle(player, THEME + "Creating Island...", "§7Preparing area..");
+        generationExecutor.submit(() -> {
             File schematicFile = new File(plugin.getDataFolder(), "schematics/" + type.getSchematic());
             if (!schematicFile.exists()) {
                 Bukkit.getScheduler().runTask(plugin, () -> {
@@ -128,9 +212,7 @@ public class IslandManager {
             }
             Clipboard clipboard;
             try {
-                clipboard = ClipboardFormats.findByFile(schematicFile)
-                        .getReader(new java.io.FileInputStream(schematicFile))
-                        .read();
+                clipboard = loadSchematic(schematicFile);
             } catch (Exception ex) {
                 ex.printStackTrace();
                 Bukkit.getScheduler().runTask(plugin, () -> {
@@ -142,55 +224,51 @@ public class IslandManager {
             int width = clipboard.getRegion().getWidth();
             int length = clipboard.getRegion().getLength();
             int height = clipboard.getRegion().getHeight();
-            int[] coords = getNextRandomCoords(bukkitWorld, width, length, 750, 1000, 20000);
+
+            BlockVector3 relativeSpawn = findGoldBlockInClipboard(clipboard);
+
+            int[] coords = getNextAvailableCoords(750);
             int x = coords[0];
             int z = coords[1];
             final int surfaceY = 71;
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                World weWorld = BukkitAdapter.adapt(bukkitWorld);
-                BlockVector3 pasteLocation = BlockVector3.at(x, surfaceY - 1, z);
-                try (EditSession editSession = com.sk89q.worldedit.WorldEdit.getInstance()
-                        .newEditSessionBuilder()
-                        .world(weWorld)
-                        .maxBlocks(-1)
-                        .build()) {
-                    clipboard.paste(weWorld, pasteLocation, false, false, null);
-                    CuboidRegion pastedRegion = new CuboidRegion(
-                            pasteLocation,
-                            pasteLocation.add(width - 1, height - 1, length - 1)
-                    );
-                    relightRegion(editSession, pastedRegion);
-                } catch (Exception ex) {
-                    ex.printStackTrace();
-                    cancelPersistentTitle(player);
-                    send(player, "§cError pasting schematic. Contact admin.");
-                    return;
-                }
-                Bukkit.getScheduler().runTaskLater(plugin, () -> {
-                    int scanRadius = 32;
-                    Location goldCenter = null;
-                    OUTER:
-                    for (int dx = -scanRadius; dx <= scanRadius; dx++) {
-                        for (int dy = -10; dy <= 40; dy++) {
-                            for (int dz = -scanRadius; dz <= scanRadius; dz++) {
-                                Location check = new Location(bukkitWorld, x + dx, surfaceY + dy, z + dz);
-                                if (check.getBlock().getType() == Material.GOLD_BLOCK) {
-                                    goldCenter = check;
-                                    break OUTER;
-                                }
-                            }
-                        }
+
+            int chunkRadius = Math.max(width, length) / 2 + 16;
+            preloadChunks(bukkitWorld, x, z, chunkRadius).thenRun(() -> {
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    showPersistentTitle(player, THEME + "Creating Island...", "§7Placing island...");
+
+                    World weWorld = BukkitAdapter.adapt(bukkitWorld);
+                    BlockVector3 pasteLocation = BlockVector3.at(x, surfaceY - 1, z);
+                    try (EditSession editSession = com.sk89q.worldedit.WorldEdit.getInstance()
+                            .newEditSessionBuilder()
+                            .world(weWorld)
+                            .maxBlocks(-1)
+                            .fastMode(true)
+                            .build()) {
+                        clipboard.paste(weWorld, pasteLocation, false, false, null);
+                        CuboidRegion pastedRegion = new CuboidRegion(
+                                pasteLocation,
+                                pasteLocation.add(width - 1, height - 1, length - 1)
+                        );
+                        relightRegion(editSession, pastedRegion);
+                    } catch (Exception ex) {
+                        ex.printStackTrace();
+                        cancelPersistentTitle(player);
+                        send(player, "§cError pasting schematic. Contact admin.");
+                        return;
                     }
-                    int centerX = (goldCenter != null) ? goldCenter.getBlockX() : x;
-                    int centerZ = (goldCenter != null) ? goldCenter.getBlockZ() : z;
-                    int centerY = (goldCenter != null) ? goldCenter.getBlockY() : surfaceY;
-                    int safeY = centerY + 1;
-                    while (safeY < bukkitWorld.getMaxHeight() - 1 &&
-                            bukkitWorld.getBlockAt(centerX, safeY, centerZ).getType() != Material.AIR) {
-                        safeY++;
+
+                    Location spawn;
+                    if (relativeSpawn != null) {
+                        int spawnX = x + relativeSpawn.getX();
+                        int spawnY = surfaceY + relativeSpawn.getY() + 1;
+                        int spawnZ = z + relativeSpawn.getZ();
+                        spawn = new Location(bukkitWorld, spawnX + 0.5, spawnY, spawnZ + 0.5);
+                    } else {
+                        spawn = new Location(bukkitWorld, x + width / 2.0, surfaceY + 2, z + length / 2.0);
                     }
-                    Location spawn = new Location(bukkitWorld, centerX + 0.5, safeY + 0.1, centerZ + 0.5);
-                    IslandData data = new IslandData(type.getId(), centerX, centerZ);
+
+                    IslandData data = new IslandData(type.getId(), spawn.getBlockX(), spawn.getBlockZ());
                     data.setBorderLevel(0);
                     data.setSchematicFile(type.getSchematic());
                     data.setOriginX(x);
@@ -204,8 +282,8 @@ public class IslandManager {
                     updateIslandRegion(player, data);
                     player.teleport(spawn);
                     cancelPersistentTitle(player);
-                    send(player, "§aIsland created at §e" + centerX + " " + safeY + " " + centerZ + "§a!");
-                }, 10L);
+                    send(player, "§aIsland created!");
+                });
             });
         });
     }
@@ -238,6 +316,8 @@ public class IslandManager {
             send(player, "§cYou do not have an island.");
             return;
         }
+        String key = data.getOriginX() + "," + data.getOriginZ();
+        occupiedCoordinates.remove(key);
         org.bukkit.World bukkitWorld = Bukkit.getWorld("world");
         if (bukkitWorld == null) {
             send(player, "§cWorld not found (world). Contact admin.");
@@ -254,7 +334,7 @@ public class IslandManager {
             }
         });
         removeVirtualGlassBorder(player);
-        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+        generationExecutor.submit(() -> {
             int minX = data.getOriginX();
             int minY = data.getOriginY();
             int minZ = data.getOriginZ();
@@ -271,6 +351,7 @@ public class IslandManager {
                         .newEditSessionBuilder()
                         .world(weWorld)
                         .maxBlocks(-1)
+                        .fastMode(true)
                         .build()) {
                     Pattern air = new BlockPattern(BlockTypes.AIR.getDefaultState());
                     editSession.setBlocks((Region) region, air);
@@ -390,6 +471,11 @@ public class IslandManager {
                 data.setSizeZ(dataConfig.getInt("islands." + uuidStr + ".sizeZ", 100));
                 playerIslands.put(UUID.fromString(uuidStr), data);
             }
+            occupiedCoordinates.clear();
+            for (IslandData data : playerIslands.values()) {
+                String key = data.getOriginX() + "," + data.getOriginZ();
+                occupiedCoordinates.add(key);
+            }
         }
     }
 
@@ -470,5 +556,9 @@ public class IslandManager {
 
     public BeachIslands getPlugin() {
         return plugin;
+    }
+
+    public void shutdown() {
+        generationExecutor.shutdownNow();
     }
 }
